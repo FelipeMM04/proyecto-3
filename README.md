@@ -183,6 +183,30 @@ erDiagram
 
 ---
 
+#### 6.3 Tablas operativas para el componente Streaming
+
+Para que el consumidor Kafka persista las métricas agregadas en tiempo real y audite los eventos rechazados desde el primer arranque, el script de inicialización crea ambas tablas vacías:
+
+```sql
+CREATE TABLE IF NOT EXISTS streaming_metrics (
+    departamento VARCHAR(100) PRIMARY KEY,
+    total_pst_procesados INTEGER NOT NULL DEFAULT 0,
+    total_empleados_stream INTEGER NOT NULL DEFAULT 0,
+    total_habitaciones_stream INTEGER NOT NULL DEFAULT 0,
+    total_camas_stream INTEGER NOT NULL DEFAULT 0,
+    alertas_alto_impacto_laboral INTEGER NOT NULL DEFAULT 0,
+    ultima_actualizacion TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS streaming_invalid_events (
+    id_error SERIAL PRIMARY KEY,
+    payload_crudo TEXT,
+    motivo_rechazo VARCHAR(255) NOT NULL,
+    fecha_rechazo TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+```
+---
+
 ### 8. Streaming Pipeline
 
 El componente de streaming está implementado en Python sobre **Apache Kafka** (modo KRaft) y persiste sus resultados agregados directamente en PostgreSQL (`dw_turismo_ods8_v2`).
@@ -227,7 +251,7 @@ El **Kafka Consumer (`streaming/consumer.py`)** ejecuta 5 reglas de validación 
 
 Los mensajes que incumplen el contrato son rechazados sin detener el servicio, registrados en la tabla de auditoría `streaming_invalid_events` y confirmados en offset para evitar bloqueos del consumidor.
 
-#### 8.4 Métricas de Streaming (`streaming_metrics`)
+#### 8.4 Métricas de Streaming 
 Por cada evento válido, el consumidor ejecuta una actualización incremental (`UPSERT` vía `ON CONFLICT DO UPDATE`) en la tabla `streaming_metrics` de PostgreSQL, manteniendo 4 indicadores clave por departamento:
 1. **`total_pst_procesados`:** Conteo acumulado de prestadores turísticos procesados en el flujo.
 2. **`total_empleados_stream`:** Suma acumulada de empleos formales directos reportados (indicador directo ODS 8).
