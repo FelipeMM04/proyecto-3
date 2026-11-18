@@ -7,6 +7,182 @@ Adicional a la ingesta batch histórica del Registro Nacional de Turismo (RNT) d
 
 ---
 
+### 4. Batch ETL Pipeline
+
+El pipeline batch está orquestado con Apache Airflow y procesa dos fuentes:
+
+| Fuente | Tipo | Mecanismo de extracción | Frecuencia |
+| :--- | :--- | :--- | :--- |
+| **Registro Nacional de Turismo (RNT, MinCIT)** | Dataset estático (CSV, 679.548 filas, corte 2026-09-15) | Lectura del snapshot `data/source/RNT_20260915.csv.gz` | Por lote, en cada ejecución del DAG |
+| **Indicadores/población DANE** | Fuente externa (API / archivo DANE) | Llamada periódica; la respuesta cruda se conserva en `data/raw/api/<batch>` para trazabilidad | Por lote, en cada ejecución del DAG |
+
+---
+
+#### 4.1 Estructura del DAG
+
+`dags/` contiene solo orquestación; la lógica vive en `src/etl/` (extracción, validación, transformación, carga), lo que permite probarla sin Airflow.
+
+```mermaid
+graph LR
+    A[extract_rnt] --> C[validate_raw_rnt<br/>Great Expectations]
+    B[extract_dane_api] --> D[validate_raw_api<br/>Great Expectations]
+    C --> E[transform_integrate]
+    D --> E
+    E --> F[validate_prepared<br/>Great Expectations]
+    F --> G[load_dimensional_dw]
+    G --> H[(PostgreSQL<br/>dw_turismo_ods8_v2)]
+```
+
+| Etapa | Qué hace | Si falla |
+| :--- | :--- | :--- |
+| **Extract** | Lee el CSV del RNT y consulta la fuente DANE; guarda el lote crudo con identificador de batch. | La tarea falla y el DAG se detiene; nada llega al DW. |
+| **Validate raw (Gate 1 y 2)** | Suites GE sobre cada fuente cruda. | Reglas Critical → tarea en rojo y bloqueo de la rama. Warning → se registra y continúa. |
+| **Transform / Integrate** | Limpieza e integración según el modelo dimensional (tabla 4.2). | Excepción → tarea fallida. |
+| **Validate prepared (Gate 3)** | Suite GE sobre los datos ya integrados, antes de tocar el DW. | Reglas Critical → tarea en rojo y `load_dimensional_dw` queda en `upstream_failed`. |
+| **Load** | Carga dimensiones y luego hechos en PostgreSQL, en una sola transacción. | Rollback: el DW conserva la versión anterior. |
+
+---
+
+#### 4.2 Transformaciones principales
+
+Las transformaciones salen del EDA (ver sección 2 del README); cada una responde a un hallazgo medido sobre los datos reales.
+
+| ID | Transformación | Hallazgo que la motiva |
+| :--- | :--- | :--- |
+| `T01b` | Reparación de mojibake en texto (`OCAÃ‘A` → `OCAÑA`) | 10.577 filas de municipio y 44.407 de razón social afectadas |
+| `T02a` | Normalización de enteros con punto de miles (`"1.008"` → `1008`) en `CODIGO_RNT` | Leídos como decimal y truncados, ~245.646 prestadores colapsaban en 428 |
+| — | `zfill` de códigos DIVIPOLA (municipio 5 dígitos, departamento 2) | 137.360 filas con código de municipio de 4 dígitos (cero inicial perdido) |
+| — | `strip` + `upper` en campos de texto; imputación `'NO REGISTRA'` en razón social nula | Duplicados artificiales y etiquetas vacías en dimensiones |
+| — | Cuarentena de registros con municipio `(FUERA DEL PAIS)` (código `1`) | 22 filas sin ubicación nacional válida |
+| — | Left join RNT ↔ población DANE por `(codigo_municipio, anio)`; población no encontrada → `0` | 7.034 de 7.097 pares municipio-año (99,1 %) encuentran población |
+
+---
+
+#### 4.3 Ejecución y programación
+
+El DAG se puede lanzar manualmente desde la UI (`http://localhost:8080`) o por CLI (sección 10).
+
+* **Programación:** `[PENDIENTE: indicar el schedule real, p. ej. @daily o @weekly]` con `catchup=False`.
+* **Reintentos:** `[PENDIENTE: indicar retries / retry_delay configurados]`.
+
+---
+
+### 5. Data Quality
+
+La validación usa Great Expectations (GX) en tres puntos del flujo (gates). Las reglas están catalogadas en `gx/` y documentadas en `docs/quality.md`.
+
+#### 5.1 Compuertas
+
+| Gate | Datos evaluados | Suite | Decisión |
+| :--- | :--- | :--- | :--- |
+| **1** | RNT crudo | `suite_rnt_raw` | Critical bloquea la rama del RNT |
+| **2** | API/DANE cruda | `suite_dane_raw` | Critical bloquea la rama de la API |
+| **3** | Datos integrados y preparados | `suite_dw_prepared` | Critical impide cualquier carga al DW |
+
+#### 5.2 Reglas y severidad
+
+| ID | Capa | Expectation GX | Severidad | Respuesta |
+| :--- | :--- | :--- | :--- | :--- |
+| `DQ-01` | RNT | `expect_column_values_to_be_between(numero_de_empleados, min_value=0)` | Critical | Bloquea |
+| `DQ-02` | RNT | `expect_column_pair_values_A_to_be_greater_than_B(numero_de_camas, numero_de_habitaciones, or_equal=True)` | Warning | Registra y continúa (6.541 filas, 0,96 %) |
+| `DQ-03` | Preparada | `expect_compound_columns_to_be_unique([codigo_rnt, anio])` | Critical | Bloquea (grano de la tabla de hechos) |
+| `DQ-04` | API | `expect_column_value_lengths_to_equal(codigo_departamento, 2)` | Critical | Bloquea si persiste tras `zfill(2)` |
+| `DQ-05` | API | `expect_column_values_to_be_between(tasa_desempleo / tasa_informalidad, 0, 100)` | Warning/High | Registra y continúa |
+| `DQ-06` | Preparada | Integridad referencial hacia `dim_ubicacion` | Critical | Bloquea |
+| `DQ-P04 / DQ-P06` | RNT | Vigilancia de la normalización de `CODIGO_RNT` (punto de miles) | Critical | Bloquea |
+| `DQ-P07` | RNT | Vigilancia de mojibake en texto | Warning | Registra |
+
+---
+
+#### 5.3 Comportamiento ante un fallo crítico
+
+* La tarea de validación lanza una excepción cuando una expectativa Critical no se cumple.
+* En Airflow la tarea aparece en rojo (`failed`) y las tareas siguientes quedan en `upstream_failed`.
+* `load_dimensional_dw` no se ejecuta, por lo que las tablas finales del DW no se modifican.
+* El resultado de la validación (JSON de GX) queda guardado en `[PENDIENTE: ruta, p. ej. data/validation_results/<batch>.json]` y el detalle se ve en el log de la tarea.
+
+Las fallas controladas se provocan con el parámetro `fault_injection` del DAG:
+
+| Valor | Efecto | Resultado esperado |
+| :--- | :--- | :--- |
+| `primary_negative_employees` | Inyecta empleados negativos en el RNT | DQ-01 falla → carga bloqueada |
+| `primary_drop_column` | Elimina una columna obligatoria del RNT | Falla de esquema → carga bloqueada |
+| `api_null_keys` | Deja claves nulas en la API | Falla Critical → carga bloqueada |
+
+---
+
+### 6. Data Warehouse
+
+Motor: PostgreSQL (puerto local `5433`), base `dw_turismo_ods8_v2`. Esquema DDL en `sql/create_dw_v2.sql`.
+
+#### 6.1 Modelo dimensional (esquema en estrella, dos tablas de hechos)
+
+```mermaid
+erDiagram
+    fact_turismo_anual {
+        serial id_fact PK
+        int codigo_rnt FK
+        int codigo_municipio FK
+        int id_categoria FK
+        int anio FK
+        int numero_de_habitaciones
+        int numero_de_camas
+        int numero_de_empleados
+    }
+    fact_indicadores_departamentales {
+        serial id_indicador PK
+        int codigo_departamento
+        int anio FK
+        bigint total_empleo_formal_dane
+    }
+    dim_ubicacion {
+        int codigo_municipio PK
+        string municipio
+        int codigo_departamento
+        string departamento
+        int poblacion_total_estimada
+    }
+    dim_categoria {
+        serial id_categoria PK
+        string categoria
+        string sub_categoria
+    }
+    dim_prestador {
+        int codigo_rnt PK
+        string razon_social
+        string nit
+        string estado_rnt
+    }
+    dim_tiempo {
+        int anio PK
+    }
+    dim_ubicacion ||--o{ fact_turismo_anual : contiene
+    dim_categoria ||--o{ fact_turismo_anual : clasifica
+    dim_prestador ||--o{ fact_turismo_anual : registra
+    dim_tiempo ||--o{ fact_turismo_anual : ocurre_en
+    dim_tiempo ||--o{ fact_indicadores_departamentales : mide
+```
+
+| Tabla | Grano | Clave primaria |
+| :--- | :--- | :--- |
+| `fact_turismo_anual` | Foto anual de un prestador (PST) del RNT en un municipio y año | `id_fact` |
+| `fact_indicadores_departamentales` | Indicadores DANE de un departamento en un año | `id_indicador` |
+| `dim_ubicacion` | Un municipio (código DIVIPOLA), con población estimada | `codigo_municipio` |
+| `dim_categoria` | Combinación única categoría/subcategoría | `id_categoria` (surrogate) |
+| `dim_prestador` | Un prestador por `codigo_rnt` | `codigo_rnt` |
+| `dim_tiempo` | Un año calendario (2019–2026) | `anio` |
+
+---
+
+#### 6.2 Estrategia de carga
+
+* **Dimensiones primero:** (`dim_tiempo`, `dim_ubicacion`, `dim_categoria`, `dim_prestador`) y hechos después, para respetar las llaves foráneas.
+* **Reemplazo atómico:** La carga completa corre en una transacción; si algo falla se hace rollback y el DW queda como estaba. Es idempotente: reejecutar el DAG con el mismo lote no duplica filas (Test C).
+* **Solo datos validados:** La carga solo se ejecuta si el Gate 3 terminó sin fallas críticas.
+* **Reconciliación posterior:** Se comparan los conteos aceptados contra los cargados (consultas en la sección 10.4).
+
+---
+
 ### 8. Streaming Pipeline
 
 El componente de streaming está implementado en Python sobre **Apache Kafka** (modo KRaft) y persiste sus resultados agregados directamente en PostgreSQL (`dw_turismo_ods8_v2`).
@@ -65,6 +241,114 @@ Por cada evento válido, el consumidor ejecuta una actualización incremental (`
 
 ---
 
+### 10. Execution and Reproducibility
+
+#### 10.1 Requisitos
+
+* Docker y Docker Compose v2
+* Python 3.10+ (solo para generar la clave Fernet y para pruebas locales)
+* Puertos libres: `8080` (Airflow) y `5433` (PostgreSQL del DW)
+* Al menos 8 GB de RAM disponibles para los contenedores
+
+#### 10.2 Configuración
+
+```bash
+git clone <URL_DEL_REPOSITORIO>
+cd <NOMBRE_DEL_REPOSITORIO>
+
+# 1) Variables de entorno (NO subir .env a GitHub)
+cp .env.example .env
+
+# 2) Generar la clave Fernet de Airflow y pegarla en AIRFLOW__CORE__FERNET_KEY
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Edita `.env` y define las credenciales de PostgreSQL y Airflow. Ningún usuario, contraseña o llave debe quedar escrito en el código ni en el repositorio.
+
+**Datos de entrada**
+
+* **RNT:** ya incluido en `data/source/RNT_20260915.csv.gz` (corte 2026-09-15, 679.548 filas).
+* **Población DANE (R6):** `data/source/PPED-AreaMun-2018-2042_VP.xlsx`.
+* **API DANE:** `[PENDIENTE: indicar URL/endpoint, parámetros y si requiere token (el token va en .env)]`.
+* **Prueba de humo sin datos reales:** `python scripts/make_sample_data.py data/source/rnt_sample.csv`.
+
+---
+
+#### 10.3 Levantar los servicios
+
+```bash
+docker compose up -d --build
+docker compose ps          # todos los servicios deben estar "running"/"healthy"
+```
+
+* **Airflow UI:** `http://localhost:8080`
+* **PostgreSQL del DW:** `localhost:5433`
+
+**Ejecutar el DAG**
+
+```bash
+# Desde la UI: activar el DAG y pulsar "Trigger"; o por CLI:
+docker compose exec <servicio-airflow> airflow dags unpause <dag_id>
+docker compose exec <servicio-airflow> airflow dags trigger <dag_id>
+```
+
+> `[PENDIENTE: reemplazar <servicio-airflow> y <dag_id> por los nombres reales de docker-compose.yaml y dags/.]`
+
+**Pruebas de confiabilidad (genera la evidencia de la sección 11)**
+
+```bash
+scripts/run_reliability_tests.sh A       # Test A: ejecución exitosa
+scripts/run_reliability_tests.sh B       # Test B: falla Critical controlada
+scripts/run_reliability_tests.sh C       # Test C: reejecución (idempotencia)
+scripts/run_reliability_tests.sh C_after # verificación posterior al Test C
+```
+
+**Sin Docker (solo desarrollo)**
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests
+PYTHONPATH=src python tests/e2e_local.py
+```
+
+#### 10.4 Verificar el resultado
+
+```bash
+psql -h localhost -p 5433 -U <usuario> -d dw_turismo_ods8_v2
+```
+
+```sql
+-- Conteos por tabla
+SELECT 'dim_tiempo' AS tabla, COUNT(*) FROM dim_tiempo
+UNION ALL SELECT 'dim_ubicacion', COUNT(*) FROM dim_ubicacion
+UNION ALL SELECT 'dim_categoria', COUNT(*) FROM dim_categoria
+UNION ALL SELECT 'dim_prestador', COUNT(*) FROM dim_prestador
+UNION ALL SELECT 'fact_turismo_anual', COUNT(*) FROM fact_turismo_anual
+UNION ALL SELECT 'fact_indicadores_departamentales', COUNT(*) FROM fact_indicadores_departamentales;
+
+-- Sin hechos huérfanos (debe devolver 0 en cada fila)
+SELECT COUNT(*) FROM fact_turismo_anual f LEFT JOIN dim_prestador  p ON f.codigo_rnt      = p.codigo_rnt      WHERE p.codigo_rnt      IS NULL;
+SELECT COUNT(*) FROM fact_turismo_anual f LEFT JOIN dim_ubicacion  u ON f.codigo_municipio = u.codigo_municipio WHERE u.codigo_municipio IS NULL;
+SELECT COUNT(*) FROM fact_turismo_anual f LEFT JOIN dim_categoria  c ON f.id_categoria     = c.id_categoria     WHERE c.id_categoria     IS NULL;
+
+-- Grano: debe devolver 0 duplicados
+SELECT codigo_rnt, anio, COUNT(*) FROM fact_turismo_anual GROUP BY 1,2 HAVING COUNT(*) > 1;
+
+-- Reconciliación de la métrica principal
+SELECT SUM(numero_de_empleados) FROM fact_turismo_anual;
+```
+
+* **Criterio de éxito:** `fact_turismo_anual` = 679.548 filas, 0 huérfanos, 0 duplicados en `(codigo_rnt, anio)`, DAG en verde, y el Test B deja el DW sin cambios.
+
+#### 10.5 Detener y reiniciar
+
+```bash
+docker compose down        # detiene los servicios y conserva los datos
+docker compose down -v     # además borra los volúmenes (reinicio limpio)
+```
+
+---
+
 ### 11. Functional Evidence (Componente Streaming)
 
 #### 11.1 Ejecución en vivo: Kafka Producer 
@@ -85,3 +369,46 @@ Por cada evento válido, el consumidor ejecuta una actualización incremental (`
 
 **2. Reinicio del Consumer y recuperación automática de eventos retenidos sin pérdida de datos:**
 ![Recuperación del Consumer](assets/evidencia_caida_consumer.png)
+
+---
+
+### 11. Functional Evidence
+
+#### 11.1 Airflow
+
+| Evidencia | Qué debe verse | Archivo |
+| :--- | :--- | :--- |
+| DAG exitoso – Graph View | Todas las tareas en verde | `[PENDIENTE: docs/evidence/airflow_graph_success.png]` |
+| DAG exitoso – Grid View | Ejecución completa con fecha y duración | `[PENDIENTE: docs/evidence/airflow_grid_success.png]` |
+| Log de `load_dimensional_dw` | Mensajes de carga y conteos | `[PENDIENTE: docs/evidence/airflow_log_load.png]` |
+| Falla controlada (Test B) | Tarea de validación en rojo y `load_dimensional_dw` en `upstream_failed` | `[PENDIENTE: docs/evidence/airflow_graph_failure.png]` |
+
+#### 11.2 Great Expectations
+
+| Evidencia | Qué debe verse | Archivo |
+| :--- | :--- | :--- |
+| Resultado exitoso (Test A) | Suites con `success: true` y estadísticas de cada regla | `[PENDIENTE: docs/evidence/ge_results_success.png]` |
+| Resultado de falla (Test B) | Regla Critical con `success: false`, `unexpected_count` y la acción de bloqueo | `[PENDIENTE: docs/evidence/ge_results_failure.png]` |
+
+#### 11.3 PostgreSQL
+
+| Evidencia | Qué debe verse | Archivo |
+| :--- | :--- | :--- |
+| Tablas del DW | `\dt` mostrando 4 dimensiones y 2 tablas de hechos | `[PENDIENTE: docs/evidence/pg_tables.png]` |
+| Conteos por tabla | Resultado de la consulta de la sección 10.4 | `[PENDIENTE: docs/evidence/pg_counts.png]` |
+| Integridad | 0 huérfanos y 0 duplicados de grano | `[PENDIENTE: docs/evidence/pg_integrity.png]` |
+| DW intacto tras el Test B | Mismos conteos antes y después de la falla | `[PENDIENTE: docs/evidence/pg_after_failure.png]` |
+| Tabla vacía de streaming | `SELECT COUNT(*) FROM streaming_metrics;` → 0 antes de iniciar el consumidor | `[PENDIENTE: docs/evidence/pg_streaming_empty.png]` |
+
+#### 11.4 Reconciliación de la carga
+
+| Tabla | Filas aceptadas (origen) | Filas cargadas | Estado |
+| :--- | :--- | :--- | :--- |
+| `dim_tiempo` | `[PENDIENTE]` | `[PENDIENTE]` | `[PENDIENTE]` |
+| `dim_ubicacion` | `[PENDIENTE]` | `[PENDIENTE]` | `[PENDIENTE]` |
+| `dim_categoria` | `[PENDIENTE]` | `[PENDIENTE]` | `[PENDIENTE]` |
+| `dim_prestador` | `[PENDIENTE]` | `[PENDIENTE]` | `[PENDIENTE]` |
+| `fact_turismo_anual` | 679.548 | `[PENDIENTE]` | `[PENDIENTE]` |
+| `fact_indicadores_departamentales` | `[PENDIENTE]` | `[PENDIENTE]` | `[PENDIENTE]` |
+
+---
