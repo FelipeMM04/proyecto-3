@@ -515,9 +515,6 @@ docker compose down -v     # además borra los volúmenes (reinicio limpio)
 | `fact_indicadores_departamentales` | `[PENDIENTE]` | `[PENDIENTE]` | `[PENDIENTE]` |
 
 ---
-
-```markdown
 #### 11.6 Dashboard en Tiempo Real (Streamlit)
 ![Dashboard en Tiempo Real — Streaming RNT](assets/dashboard_streaming.png)
-```
 ---
