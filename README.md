@@ -1,3 +1,52 @@
+## 1. Projecto 3
+
+### 1.1 Problema y Objetivo del Proyecto
+Los datos del Registro Nacional de Turismo (RNT) y las estadísticas laborales del DANE se publican por separado y con distintos formatos, lo que dificulta medir el crecimiento turístico y la generación de empleo formal en Colombia (**ODS 8**).
+
+**Objetivo:** Construir un pipeline híbrido (**Batch + Streaming**) automatizado y validado que integre los datos históricos (2019–2026) con eventos operativos en tiempo real, permitiendo analizar el impacto laboral e infraestructura del turismo en dos dashboards (histórico y en vivo).
+
+### 1.2 Requerimientos del Sistema: Batch vs. Streaming
+
+#### Capa Batch (Análisis Histórico — Airflow + PostgreSQL)
+Resuelve las preguntas estratégicas que requieren cruzar años completos y datos demográficos del DANE[cite: 1, 2]:
+* **R1:** Concentración territorial del empleo formal en el sector turístico.
+* **R2:** Capacidad de alojamiento e infraestructura instalada por territorio.
+* **R3:** Distribución de empleo e infraestructura según categoría comercial.
+* **R4:** Densidad y tamaño promedio de empleabilidad por establecimiento.
+* **R5:** Evolución temporal del registro de prestadores y dinamismo laboral (2019–2026).
+* **R6:** Capacidad de alojamiento por habitante (Densidad Turística Municipal).
+* **R7:** Impacto del empleo turístico en el mercado laboral regional.
+
+#### Capa Streaming (Monitoreo en Tiempo Real — Kafka + PostgreSQL)
+Justifica la baja latencia al permitir detectar cambios operativos al instante, sin esperar al cierre del proceso Batch diario o semanal[cite: 1]:
+* **Actividad e infraestructura en vivo:** Conteo continuo de prestadores (PST), habitaciones y camas procesadas por departamento.
+* **Empleo formal en tiempo real:** Acumulación inmediata de empleos directos reportados.
+* **Alertas de alto impacto laboral:** Detección temprana por departamento de establecimientos que generan **20 o más empleos directos**.
+
+---
+
+## 2. Data Sources and EDA
+
+### Fuentes de Datos
+* **Registro Nacional de Turismo:** Información de prestadores turísticos activos en Colombia, incluyendo ubicación, categoría comercial, habitaciones, camas y empleos directos.
+* **Datos DANE:** Indicadores poblacionales y del mercado laboral regional para medir densidad turística e impacto en el empleo.
+* **Eventos en Tiempo Real:** Reportes operativos enviados mediante Apache Kafka y almacenados en PostgreSQL.
+
+### Análisis Exploratorio
+El análisis se realizó en el notebook `notebooks/eda_rnt_ods8.ipynb` sobre la base de datos del proyecto para revisar la distribución y calidad de la información:
+
+![Gráficas EDA](assets/eda_graficas.png)
+
+### Hallazgos y Reglas de Calidad Aplicadas
+Los resultados del análisis definieron las reglas de limpieza y validación del sistema:
+
+* **Ceros válidos en capacidad física:** Categorías como agencias de viajes y gastronomía no tienen habitaciones ni camas, por lo que se aceptan valores mayores o iguales a cero y solo se rechazan números negativos.
+* **Estándar en llaves de cruce:** Los códigos de municipio y categoría se validaron como enteros obligatorios para evitar pérdidas al cruzar las tablas del modelo estrella.
+* **Regla de alerta laboral:** Al detectar prestadores que superan los 20 empleos directos, se fijó ese umbral en Kafka para generar alertas de alto impacto laboral.
+* **Validación de mensajes en vivo:** Se establecieron campos obligatorios y tipos de datos estrictos para desviar registros con errores a una tabla de rechazo sin afectar las métricas en tiempo real.
+
+---
+
 ### 2.2 Data Sources
 
 Adicional a la ingesta batch histórica del Registro Nacional de Turismo (RNT) de Colombia, el sistema incorpora un flujo de eventos en tiempo real orientado al monitoreo continuo del **ODS 8 (Meta 8.9: Turismo sostenible y creación de empleo local)**.
@@ -207,6 +256,16 @@ CREATE TABLE IF NOT EXISTS streaming_invalid_events (
 ```
 ---
 
+### 7. Batch Analytical Dashboard
+
+Tablero histórico conectado al Data Warehouse en PostgreSQL (`dw_turismo_ods8_v2`) para responder los requerimientos **R1–R7** (ODS 8):
+
+- **KPIs:** Total de PST activos, empleos formales directos, capacidad instalada (habitaciones y camas), densidad turística municipal y participación sobre el empleo regional DANE.
+- **Visualizaciones:** Ranking departamental de empleo y alojamiento (R1–R2), comparativa por categoría comercial (R3–R4) y serie histórica 2019–2026 cruzada con mercado laboral DANE (R5–R7).
+- **Diferencia con tiempo real:** Analiza cortes históricos consolidados por lote en lugar de eventos individuales en vivo.
+
+---
+
 ### 8. Streaming Pipeline
 
 El componente de streaming está implementado en Python sobre **Apache Kafka** (modo KRaft) y persiste sus resultados agregados directamente en PostgreSQL (`dw_turismo_ods8_v2`).
@@ -262,6 +321,15 @@ Por cada evento válido, el consumidor ejecuta una actualización incremental (`
 * **Eventos inválidos:** Ante payloads corruptos, campos faltantes, tipos erróneos o valores negativos, el consumidor captura la excepción de contrato, persiste el detalle del error en `streaming_invalid_events` y continúa consumiendo los siguientes offsets sin interrupción.
 * **Interrupción temporal del Consumer:** Al utilizar `enable_auto_commit=False` y confirmar el offset únicamente después de completar el `COMMIT` en PostgreSQL, si el consumidor se detiene temporalmente mientras el productor sigue publicando, los mensajes quedan retenidos de forma durable en el log de Kafka y son procesados automáticamente al reiniciar el consumidor.
 * **Limitaciones conocidas:** La deduplicación por `event_id` se mantiene en memoria durante el ciclo de vida del proceso del consumidor; ante un reinicio completo del proceso, la idempotencia a nivel de fila dependería de persistir los `event_id` procesados en una tabla dedicada en PostgreSQL.
+
+---
+
+### 9. Real-Time Dashboard
+
+Implementado en `dashboards/dashboard_streaming.py` con **Streamlit** y **Plotly**, consulta `streaming_metrics` y `streaming_invalid_events` en PostgreSQL (`localhost:5433`) con auto-refresco cada **2 segundos**:
+
+- **Métricas y gráficas:** KPIs con delta en vivo (`+Δ`), curva temporal de empleos formales acumulados, bitácora de últimos eventos procesados, comparativa departamental y auditoría de eventos rechazados.
+- **Diferencia con el dashboard batch:** Monitorea el flujo entrante con latencia de segundos para detectar alertas laborales ($\ge 20$ empleados) y fallos de contrato al instante.
 
 ---
 
@@ -334,6 +402,17 @@ pip install -r requirements-dev.txt
 pytest tests
 PYTHONPATH=src python tests/e2e_local.py
 ```
+
+**Ejecución de Streaming y Dashboard en Tiempo Real**
+
+```bash
+streamlit run dashboards/dashboard_streaming.py   # Terminal 1: Dashboard en vivo
+python streaming/consumer.py                      # Terminal 2: Consumidor Kafka
+python streaming/producer.py                      # Terminal 3: Productor de eventos
+python streaming/test_invalid_events.py           # Prueba de eventos inválidos
+```
+
+---
 
 #### 10.4 Verificar el resultado
 
@@ -435,4 +514,10 @@ docker compose down -v     # además borra los volúmenes (reinicio limpio)
 | `fact_turismo_anual` | 679.548 | `[PENDIENTE]` | `[PENDIENTE]` |
 | `fact_indicadores_departamentales` | `[PENDIENTE]` | `[PENDIENTE]` | `[PENDIENTE]` |
 
+---
+
+```markdown
+#### 11.6 Dashboard en Tiempo Real (Streamlit)
+![Dashboard en Tiempo Real — Streaming RNT](assets/dashboard_streaming.png)
+```
 ---
